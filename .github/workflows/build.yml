@@ -5,6 +5,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -14,8 +16,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
-      - name: Create project files
+      - name: Create project files (sirf pehli baar)
         run: |
+          if [ ! -f app/build.gradle.kts ]; then
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
               repositories {
@@ -112,8 +115,39 @@ jobs:
                       android:name=".VoiceService"
                       android:exported="false"
                       android:foregroundServiceType="microphone" />
+
+                  <service
+                      android:name=".AutoSendService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
               </application>
           </manifest>
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="a11y_desc">Jarvis WhatsApp me aapka bola hua message apne aap send karta hai</string>
+          </resources>
+          EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="200"
+              android:packageNames="com.whatsapp,com.whatsapp.w4b"
+              android:description="@string/a11y_desc" />
           EOF
           mkdir -p app/src/main/java/com/example/jarvis
           cat > app/src/main/java/com/example/jarvis/MainActivity.kt <<'EOF'
@@ -145,7 +179,7 @@ jobs:
                   }
 
                   root.addView(TextView(this).apply {
-                      text = "Jarvis Voice Assistant\n\nPehle 1 aur 2 karo, phir Start dabao.\nBand karne ke liye \"bye\" bolo."
+                      text = "Jarvis Voice Assistant\n\nPehle 1, 2 aur 3 karo, phir Start dabao.\nBand karne ke liye \"bye\" bolo."
                       textSize = 16f
                       setPadding(0, 0, 0, 32)
                   })
@@ -162,6 +196,9 @@ jobs:
                       startActivity(
                           Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
                       )
+                  }
+                  addButton("3. WhatsApp auto-send (Accessibility ON karo)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                   }
                   addButton("Start") { startAssistant() }
                   addButton("Stop") { stopService(Intent(this, VoiceService::class.java)) }
@@ -201,16 +238,22 @@ jobs:
           import android.app.Service
           import android.content.Intent
           import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.media.AudioManager
           import android.os.Build
           import android.os.Bundle
           import android.os.Handler
           import android.os.IBinder
           import android.os.Looper
+          import android.provider.Settings
           import android.speech.RecognitionListener
           import android.speech.RecognizerIntent
           import android.speech.SpeechRecognizer
           import android.speech.tts.TextToSpeech
           import android.speech.tts.UtteranceProgressListener
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
           import java.util.Locale
 
           class VoiceService : Service(), TextToSpeech.OnInitListener {
@@ -231,6 +274,8 @@ jobs:
               private var speaking = false
               private var stopAfterSpeak = false
               private var useLang = true
+              private var overlayView: View? = null
+              private val mutedStreams = mutableListOf<Int>()
               private lateinit var commands: CommandHandler
 
               override fun onBind(intent: Intent?): IBinder? = null
@@ -245,6 +290,16 @@ jobs:
                   ttsInitDone = true
                   if (status == TextToSpeech.SUCCESS) {
                       tts?.language = Locale("en", "IN")
+                      tts?.setPitch(1.25f)
+                      tts?.setSpeechRate(0.95f)
+                      try {
+                          val female = tts?.voices?.firstOrNull {
+                              it.locale.language == "en" && it.locale.country == "IN" &&
+                                  it.name.contains("female", ignoreCase = true)
+                          }
+                          if (female != null) tts?.voice = female
+                      } catch (e: Exception) {
+                      }
                       tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                           override fun onStart(utteranceId: String?) {}
                           override fun onDone(utteranceId: String?) = afterSpeak()
@@ -277,6 +332,7 @@ jobs:
                       return START_NOT_STICKY
                   }
                   startInForeground("Jarvis chal raha hai")
+                  addOverlay()
                   if (!running) {
                       running = true
                       if (ttsInitDone) begin() else pendingStart = true
@@ -316,6 +372,63 @@ jobs:
                   }
               }
 
+              @Suppress("DEPRECATION")
+              private fun addOverlay() {
+                  if (overlayView != null || !Settings.canDrawOverlays(this)) return
+                  try {
+                      val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                      val type = if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                      else WindowManager.LayoutParams.TYPE_PHONE
+                      val lp = WindowManager.LayoutParams(
+                          1, 1, type,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                          PixelFormat.TRANSLUCENT
+                      )
+                      lp.gravity = Gravity.START or Gravity.TOP
+                      val v = View(this)
+                      wm.addView(v, lp)
+                      overlayView = v
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun muteBeep() {
+                  if (mutedStreams.isNotEmpty()) return
+                  val am = getSystemService(AudioManager::class.java) ?: return
+                  for (s in intArrayOf(AudioManager.STREAM_MUSIC, AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM)) {
+                      try {
+                          if (!am.isStreamMute(s)) {
+                              am.adjustStreamVolume(s, AudioManager.ADJUST_MUTE, 0)
+                              mutedStreams.add(s)
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun unmuteBeep() {
+                  if (mutedStreams.isEmpty()) return
+                  val am = getSystemService(AudioManager::class.java)
+                  if (am != null) {
+                      for (s in mutedStreams) {
+                          try {
+                              am.adjustStreamVolume(s, AudioManager.ADJUST_UNMUTE, 0)
+                          } catch (e: Exception) {
+                          }
+                      }
+                  }
+                  mutedStreams.clear()
+              }
+
+              private fun removeOverlay() {
+                  val v = overlayView ?: return
+                  try {
+                      (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(v)
+                  } catch (e: Exception) {
+                  }
+                  overlayView = null
+              }
+
               private fun updateNotif(text: String) {
                   try {
                       getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotif(text))
@@ -326,11 +439,11 @@ jobs:
               private fun begin() {
                   if (!SpeechRecognizer.isRecognitionAvailable(this)) {
                       updateNotif("Speech recognition available nahi hai")
-                      speak("Is phone me speech recognition available nahi hai", true)
+                      speak("Is phone me speech recognition nahi hai ${Persona.PET}", true)
                       return
                   }
                   createRecognizer()
-                  speak("Jarvis ready hai. Bolo")
+                  speak("Hi ${Persona.PET}, main aa gayi. Bolo, kya karna hai?")
               }
 
               private fun createRecognizer() {
@@ -342,6 +455,7 @@ jobs:
 
               private fun listen() {
                   if (!running || speaking) return
+                  muteBeep()
                   val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                       putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                       if (useLang) putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
@@ -366,6 +480,7 @@ jobs:
                       if (stopAfter) shutdown() else restartLater(300)
                       return
                   }
+                  unmuteBeep()
                   speaking = true
                   stopAfterSpeak = stopAfter
                   val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
@@ -391,7 +506,10 @@ jobs:
                       when {
                           result.stop -> speak(result.reply, true)
                           result.reply.isNotEmpty() -> speak(result.reply)
-                          else -> speak("Suna: $text. Samajh nahi aaya")
+                          else -> {
+                              updateNotif("Suna: $text (samajh nahi aaya)")
+                              restartLater(200)
+                          }
                       }
                   }
 
@@ -399,7 +517,7 @@ jobs:
                       when (error) {
                           SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                               updateNotif("Mic permission nahi hai")
-                              speak("Mic ki permission nahi hai", true)
+                              speak("Mic ki permission nahi mili ${Persona.PET}", true)
                           }
                           SpeechRecognizer.ERROR_NO_MATCH,
                           SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> restartLater(200)
@@ -428,6 +546,8 @@ jobs:
               private fun shutdown() {
                   running = false
                   handler.removeCallbacksAndMessages(null)
+                  removeOverlay()
+                  unmuteBeep()
                   stopForeground(STOP_FOREGROUND_REMOVE)
                   stopSelf()
               }
@@ -435,6 +555,8 @@ jobs:
               override fun onDestroy() {
                   running = false
                   handler.removeCallbacksAndMessages(null)
+                  removeOverlay()
+                  unmuteBeep()
                   recognizer?.destroy()
                   recognizer = null
                   tts?.stop()
@@ -442,6 +564,62 @@ jobs:
                   tts = null
                   super.onDestroy()
               }
+          }
+          EOF
+          cat > app/src/main/java/com/example/jarvis/AutoSendService.kt <<'EOF'
+          package com.example.jarvis
+
+          import android.accessibilityservice.AccessibilityService
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class AutoSendService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var armedUntil: Long = 0L
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (System.currentTimeMillis() > armedUntil) return
+                  val root = rootInActiveWindow ?: return
+                  val pkg = root.packageName?.toString() ?: return
+                  if (!pkg.startsWith("com.whatsapp")) return
+                  val btn = findSend(root, pkg) ?: return
+                  if (btn.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                      armedUntil = 0L
+                  }
+              }
+
+              private fun findSend(root: AccessibilityNodeInfo, pkg: String): AccessibilityNodeInfo? {
+                  val byId = root.findAccessibilityNodeInfosByViewId("$pkg:id/send")
+                  val c = byId?.firstOrNull()?.let { clickableOf(it) }
+                  if (c != null) return c
+                  for (label in listOf("Send", "भेजें")) {
+                      val list = root.findAccessibilityNodeInfosByText(label) ?: continue
+                      for (n in list) {
+                          val d = n.contentDescription?.toString() ?: ""
+                          if (d.equals(label, ignoreCase = true)) {
+                              val k = clickableOf(n)
+                              if (k != null) return k
+                          }
+                      }
+                  }
+                  return null
+              }
+
+              private fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  var cur: AccessibilityNodeInfo? = n
+                  var depth = 0
+                  while (cur != null && depth < 3) {
+                      if (cur.isClickable) return cur
+                      cur = cur.parent
+                      depth++
+                  }
+                  return null
+              }
+
+              override fun onInterrupt() {}
           }
           EOF
           cat > app/src/main/java/com/example/jarvis/CommandHandler.kt <<'EOF'
@@ -455,18 +633,57 @@ jobs:
           import android.net.Uri
           import android.os.Build
           import android.provider.ContactsContract
+          import android.provider.Settings
           import android.telephony.SmsManager
           import java.util.Locale
+
+          object Persona {
+              // Bolne ka pyaar bhara naam. Yahan badal sakte ho (jaise "babu", "dear" ya koi naam)
+              const val PET = "jaan"
+          }
 
           class CommandHandler(private val ctx: Context) {
 
               data class Result(val reply: String, val stop: Boolean = false)
+
+              private val pet = Persona.PET
 
               private val stopWords = setOf("bye", "by", "buy", "bai", "alvida", "goodbye")
               private val openTriggers = setOf("kholo", "khol", "open", "chalao", "launch")
               private val fillerWords = setOf(
                   "kholo", "khol", "open", "chalao", "chalu", "launch", "start",
                   "kar", "karo", "do", "de", "dena", "ko", "app", "please", "the"
+              )
+              private val ytFillers = setOf(
+                  "par", "pe", "me", "mein", "on", "in", "search", "dhundo", "dhoondo", "khojo",
+                  "chalao", "play", "karo", "kar", "lagao", "laga", "dikhao", "dikha", "for",
+                  "kholo", "open", "ko", "se", "please"
+              )
+              private val doPrev = setOf("kar", "laga", "chala", "dikha")
+
+              private val playVerbs = setOf("chalao", "chala", "play", "sunao", "dikhao", "dikha", "lagao", "laga")
+              private val mediaWords = setOf(
+                  "video", "videos", "gana", "gaana", "song", "songs", "music", "trailer", "movie", "reel", "reels"
+              )
+              private val mediaFillers = setOf(
+                  "ka", "ki", "ke", "ek", "mera", "meri", "mujhe", "mere", "liye", "koi", "kar", "karo",
+                  "do", "de", "zara", "please", "ko", "ye", "wo", "vo", "the", "a", "my", "play",
+                  "chalao", "chala", "sunao", "dikhao", "dikha", "lagao", "laga", "for", "on", "and"
+              )
+
+              private val searchTriggers = setOf("search", "google", "dhundo", "dhoondo", "khojo", "batao")
+              private val searchFillers = setOf(
+                  "search", "google", "dhundo", "dhoondo", "khojo", "batao", "par", "pe", "me", "mein",
+                  "karo", "kar", "do", "de", "ke", "bare", "baare", "about", "on", "for", "mujhe",
+                  "mere", "liye", "zara", "please", "ko", "ye", "ek", "thoda"
+              )
+              private val questionStarts = setOf(
+                  "kya", "kaun", "kon", "kaise", "kyun", "kyu", "kab", "kahan", "kitna", "kitne", "kisne",
+                  "what", "who", "how", "why", "when", "where", "which"
+              )
+              private val mapTriggers = setOf("map", "maps", "navigate", "rasta", "raasta", "directions", "route")
+              private val mapFillers = setOf(
+                  "ka", "ki", "ke", "tak", "jana", "hai", "dikhao", "dikha", "chalo", "jao", "to", "from"
               )
 
               private val msgRegex = Regex(
@@ -476,33 +693,100 @@ jobs:
               private val callRegex2 = Regex("^(.+?)\\s+ko\\s+(?:call|phone|fone|dial)(?:\\s+(?:karo|kar do|lagao|laga do))?$")
 
               fun handle(raw: String): Result {
-                  val t = raw.lowercase(Locale.ROOT).trim()
+                  val t = raw.lowercase(Locale.ROOT).trim().replace("you tube", "youtube")
                   if (t.isEmpty()) return Result("")
                   val words = t.split(Regex("\\s+"))
 
                   // 1) Band karna
                   if ((words.size <= 3 && words.any { it in stopWords }) || t.contains("band karo")) {
-                      return Result("Theek hai, bye", true)
+                      return Result("Theek hai $pet, apna khayal rakhna. Bye!", true)
                   }
 
-                  // 2) SMS / WhatsApp: "<naam> ko whatsapp karo <message>"
+                  // 2) Pyaari baatein
+                  smallTalk(t, words)?.let { return Result(it) }
+
+                  // 3) SMS / WhatsApp: "<naam> ko whatsapp karo <message>"
                   msgRegex.find(t)?.let { m ->
                       return sendMessage(m.groupValues[1].trim(), m.groupValues[2], m.groupValues[3].trim())
                   }
 
-                  // 3) Call
+                  // 4) Call
                   (callRegex1.find(t) ?: callRegex2.find(t))?.let {
                       return call(it.groupValues[1].trim())
                   }
 
-                  // 4) App kholna
+                  // 5) YouTube: "youtube par <cheez> search karo"
+                  if (words.contains("youtube") || words.contains("yt")) {
+                      return youtube(words)
+                  }
+
+                  // 6) Video / gaana chalana: "arijit ka gaana chalao"
+                  if (words.any { it in playVerbs } && (words.any { it in mediaWords } || words.first() == "play")) {
+                      return playMedia(words)
+                  }
+
+                  // 7) Map / rasta
+                  if (words.any { it in mapTriggers }) {
+                      return maps(words)
+                  }
+
+                  // 8) App kholna
                   if (words.any { it in openTriggers }) {
                       val name = words.filter { it !in fillerWords }.joinToString(" ")
                       if (name.isNotEmpty()) return openApp(name)
                   }
 
+                  // 9) Google search: "search karo ...", "... ke baare me batao", "kya/kaun/kaise ..."
+                  val explicit = words.any { it in searchTriggers } || t.contains("ke bare") || t.contains("ke baare")
+                  if (explicit || words.first() in questionStarts) {
+                      val q = if (explicit) trimEdges(words, searchFillers).joinToString(" ") else t
+                      return if (q.isEmpty()) Result("Kya search karu $pet?") else googleSearch(q)
+                  }
+
                   // Samajh nahi aaya -> chup raho aur sunte raho
                   return Result("")
+              }
+
+              private fun smallTalk(t: String, words: List<String>): String? {
+                  return when {
+                      t.contains("kaisi ho") || t.contains("kaise ho") || t.contains("how are you") ->
+                          listOf(
+                              "Main bilkul theek hu $pet, tum batao kaise ho?",
+                              "Tumse baat ho rahi hai to mast hu $pet"
+                          ).random()
+                      t.contains("love you") || t.contains("miss you") ->
+                          listOf(
+                              "Aww $pet, tum bahut pyaare ho",
+                              "Main bhi tumhe yaad karti hu $pet",
+                              "Itna pyaar? Mera dil khush ho gaya $pet"
+                          ).random()
+                      t.contains("good morning") || t.contains("suprabhat") ->
+                          "Good morning $pet! Aaj ka din bahut accha jayega"
+                      t.contains("good night") || t.contains("shubh ratri") ->
+                          "Good night $pet, meethe sapne. Kal milte hain"
+                      t.contains("thank you") || t.contains("thanks") || t.contains("shukriya") ->
+                          "Arre $pet, isme thank you kaisa. Tumhare liye kuch bhi"
+                      words.size <= 2 && words.first() in setOf("hi", "hello", "hey", "namaste") ->
+                          "Hi $pet, bolo kya karu tumhare liye?"
+                      else -> null
+                  }
+              }
+
+              private fun trimEdges(src: List<String>, fillers: Set<String>): List<String> {
+                  val w = src.toMutableList()
+                  while (w.isNotEmpty() && w.first() in fillers) w.removeAt(0)
+                  while (w.isNotEmpty()) {
+                      val last = w.last()
+                      val prev = w.getOrNull(w.size - 2)
+                      if (last in fillers) {
+                          w.removeAt(w.size - 1)
+                      } else if ((last == "do" || last == "de") && prev != null && prev in doPrev) {
+                          w.removeAt(w.size - 1)
+                      } else {
+                          break
+                      }
+                  }
+                  return w
               }
 
               private fun has(perm: String) =
@@ -524,35 +808,35 @@ jobs:
               }
 
               private fun call(who: String): Result {
-                  if (!has(Manifest.permission.CALL_PHONE)) return Result("Call ki permission nahi hai")
-                  val num = resolveNumber(who) ?: return Result("$who ka number nahi mila")
+                  if (!has(Manifest.permission.CALL_PHONE)) return Result("Call ki permission nahi mili $pet")
+                  val num = resolveNumber(who) ?: return Result("$who ka number nahi mila $pet")
                   return try {
                       ctx.startActivity(
                           Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(num)))
                               .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                       )
-                      Result("$who ko call laga raha hu")
+                      Result("Abhi $who ko call lagati hu $pet")
                   } catch (e: Exception) {
-                      Result("Call nahi lag paya")
+                      Result("Sorry $pet, call nahi lag paayi")
                   }
               }
 
               private fun sendMessage(who: String, kind: String, body: String): Result {
-                  val num = resolveNumber(who) ?: return Result("$who ka number nahi mila")
+                  val num = resolveNumber(who) ?: return Result("$who ka number nahi mila $pet")
                   return if (kind == "whatsapp") whatsapp(who, num, body) else sms(who, num, body)
               }
 
               @Suppress("DEPRECATION")
               private fun sms(who: String, num: String, body: String): Result {
-                  if (body.isEmpty()) return Result("Message kya bhejna hai? Dobara bolo")
-                  if (!has(Manifest.permission.SEND_SMS)) return Result("SMS ki permission nahi hai")
+                  if (body.isEmpty()) return Result("Message kya bhejna hai $pet? Dobara bolo")
+                  if (!has(Manifest.permission.SEND_SMS)) return Result("SMS ki permission nahi mili $pet")
                   return try {
                       val sm = if (Build.VERSION.SDK_INT >= 31) ctx.getSystemService(SmsManager::class.java)
                       else SmsManager.getDefault()
                       sm.sendMultipartTextMessage(num, null, sm.divideMessage(body), null, null)
-                      Result("$who ko SMS bhej diya")
+                      Result("$who ko SMS bhej diya $pet")
                   } catch (e: Exception) {
-                      Result("SMS nahi ja paya")
+                      Result("Sorry $pet, SMS nahi ja paya")
                   }
               }
 
@@ -565,7 +849,18 @@ jobs:
                   }
               }
 
+              private fun a11yEnabled(): Boolean {
+                  val s = Settings.Secure.getString(
+                      ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return s.contains(ctx.packageName)
+              }
+
               private fun whatsapp(who: String, num: String, body: String): Result {
+                  val enabled = a11yEnabled()
+                  if (body.isNotEmpty() && enabled) {
+                      AutoSendService.armedUntil = System.currentTimeMillis() + 20000
+                  }
                   val uri = Uri.parse("https://wa.me/${normalizeIn(num)}?text=" + Uri.encode(body))
                   val base = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                   return try {
@@ -574,9 +869,78 @@ jobs:
                       } catch (e: ActivityNotFoundException) {
                           ctx.startActivity(base)
                       }
-                      Result("$who ke liye WhatsApp khol diya, bas send dabao")
+                      when {
+                          body.isEmpty() -> Result("$who ki chat khol di $pet")
+                          enabled -> Result("Ji $pet, $who ko WhatsApp bhej rahi hu")
+                          else -> Result("$who ke liye WhatsApp khol diya, bas send dabana $pet")
+                      }
                   } catch (e: Exception) {
-                      Result("WhatsApp nahi khul paya")
+                      Result("Sorry $pet, WhatsApp nahi khul paya")
+                  }
+              }
+
+              private fun youtube(all: List<String>): Result {
+                  val q = trimEdges(all.filter { it != "youtube" && it != "yt" }, ytFillers).joinToString(" ")
+                  if (q.isEmpty()) return openApp("youtube")
+                  return ytSearch(q)
+              }
+
+              private fun playMedia(words: List<String>): Result {
+                  val q = words.filter { it !in mediaFillers }.joinToString(" ")
+                  val onlyType = q.isEmpty() || q.split(" ").all { it in mediaWords }
+                  if (onlyType) return Result("Kaunsa chalau $pet? Naam bolo")
+                  return ytSearch(q)
+              }
+
+              private fun ytSearch(q: String): Result {
+                  return try {
+                      ctx.startActivity(
+                          Intent(Intent.ACTION_SEARCH)
+                              .setPackage("com.google.android.youtube")
+                              .putExtra("query", q)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      Result("Ye lo $pet, YouTube pe $q dhundh rahi hu")
+                  } catch (e: Exception) {
+                      try {
+                          ctx.startActivity(
+                              Intent(
+                                  Intent.ACTION_VIEW,
+                                  Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(q))
+                              ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          )
+                          Result("Ye lo $pet, YouTube pe $q dhundh rahi hu")
+                      } catch (e2: Exception) {
+                          Result("Sorry $pet, YouTube nahi khul paya")
+                      }
+                  }
+              }
+
+              private fun googleSearch(q: String): Result {
+                  return try {
+                      ctx.startActivity(
+                          Intent(
+                              Intent.ACTION_VIEW,
+                              Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))
+                          ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      Result("Ye lo $pet, $q search kar rahi hu")
+                  } catch (e: Exception) {
+                      Result("Sorry $pet, search nahi ho paya")
+                  }
+              }
+
+              private fun maps(words: List<String>): Result {
+                  val q = trimEdges(words.filter { it !in mapTriggers }, searchFillers + mapFillers).joinToString(" ")
+                  if (q.isEmpty()) return Result("Kahan ka rasta chahiye $pet?")
+                  return try {
+                      ctx.startActivity(
+                          Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(q)))
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      Result("Ye lo $pet, $q ka rasta dikha rahi hu")
+                  } catch (e: Exception) {
+                      Result("Sorry $pet, map nahi khul paya")
                   }
               }
 
@@ -591,21 +955,25 @@ jobs:
                   val idx = apps.indices.firstOrNull { label(it) == q }
                       ?: apps.indices.firstOrNull { label(it).contains(q) }
                       ?: apps.indices.firstOrNull { label(it).length > 2 && q.contains(label(it)) }
-                      ?: return Result("$name naam ka app nahi mila")
+                      ?: return Result("$name naam ka app nahi mila $pet")
                   val launch = pm.getLaunchIntentForPackage(apps[idx].activityInfo.packageName)
-                      ?: return Result("$name nahi khul paya")
+                      ?: return Result("$name nahi khul paya $pet")
                   return try {
                       ctx.startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                      Result("$name khol raha hu")
+                      Result("Ji $pet, $name khol rahi hu")
                   } catch (e: Exception) {
-                      Result("$name nahi khul paya")
+                      Result("Sorry $pet, $name nahi khul paya")
                   }
               }
           }
           EOF
-      - name: Apply overrides
+          fi
+      - name: Save sources to repo
         run: |
-          if [ -d override ]; then cp -r override/. . ; fi
+          git config user.name "jarvis-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A app settings.gradle.kts build.gradle.kts gradle.properties
+          git diff --cached --quiet || (git commit -m "Save project sources" && git push)
       - name: Build
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
