@@ -1,0 +1,564 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Jarvis"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.jarvis"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.jarvis"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.SEND_SMS" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Jarvis"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".VoiceService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/jarvis
+          cat > app/src/main/java/com/example/jarvis/MainActivity.kt <<'EOF'
+          package com.example.jarvis
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(48, 48, 48, 48)
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "Jarvis Voice Assistant\n\nPehle 1 aur 2 karo, phir Start dabao.\nBand karne ke liye \"bye\" bolo."
+                      textSize = 16f
+                      setPadding(0, 0, 0, 32)
+                  })
+
+                  fun addButton(label: String, onClick: () -> Unit) {
+                      root.addView(Button(this).apply {
+                          text = label
+                          setOnClickListener { onClick() }
+                      })
+                  }
+
+                  addButton("1. Permissions do") { askPermissions() }
+                  addButton("2. Overlay permission (apps kholne ke liye)") {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                  }
+                  addButton("Start") { startAssistant() }
+                  addButton("Stop") { stopService(Intent(this, VoiceService::class.java)) }
+
+                  setContentView(root)
+              }
+
+              private fun askPermissions() {
+                  val perms = mutableListOf(
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.SEND_SMS,
+                      Manifest.permission.READ_CONTACTS
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                  requestPermissions(perms.toTypedArray(), 1)
+              }
+
+              private fun startAssistant() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      Toast.makeText(this, "Pehle permissions do", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val i = Intent(this, VoiceService::class.java)
+                  if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                  Toast.makeText(this, "Jarvis shuru ho gaya", Toast.LENGTH_SHORT).show()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/jarvis/VoiceService.kt <<'EOF'
+          package com.example.jarvis
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import java.util.Locale
+
+          class VoiceService : Service(), TextToSpeech.OnInitListener {
+
+              companion object {
+                  const val ACTION_STOP = "com.example.jarvis.STOP"
+                  private const val CHANNEL = "jarvis_channel"
+                  private const val NOTIF_ID = 1
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var running = false
+              private var speaking = false
+              private var stopAfterSpeak = false
+              private lateinit var commands: CommandHandler
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  commands = CommandHandler(this)
+                  tts = TextToSpeech(this, this)
+              }
+
+              override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) {
+                      tts?.language = Locale("en", "IN")
+                      tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                          override fun onStart(utteranceId: String?) {}
+                          override fun onDone(utteranceId: String?) = afterSpeak()
+                          @Deprecated("Deprecated in Java")
+                          override fun onError(utteranceId: String?) = afterSpeak()
+                      })
+                      ttsReady = true
+                  }
+              }
+
+              private fun afterSpeak() {
+                  handler.post {
+                      speaking = false
+                      if (stopAfterSpeak) shutdown() else listen()
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      shutdown()
+                      return START_NOT_STICKY
+                  }
+                  startInForeground()
+                  if (!running) {
+                      running = true
+                      startRecognizer()
+                  }
+                  return START_STICKY
+              }
+
+              private fun startInForeground() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel(CHANNEL, "Jarvis", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val stopPi = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, VoiceService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL)
+                  else Notification.Builder(this)
+                  @Suppress("DEPRECATION")
+                  val notif = builder
+                      .setContentTitle("Jarvis sun raha hai")
+                      .setContentText("Band karne ke liye \"bye\" bolo")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true)
+                      .addAction(android.R.drawable.ic_delete, "Band karo", stopPi)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(NOTIF_ID, notif)
+                  }
+              }
+
+              private fun startRecognizer() {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      speak("Is phone me speech recognition available nahi hai", true)
+                      return
+                  }
+                  recognizer?.destroy()
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                      setRecognitionListener(listener)
+                  }
+                  listen()
+              }
+
+              private fun listen() {
+                  if (!running || speaking) return
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+                      putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                  }
+                  try {
+                      recognizer?.startListening(i)
+                  } catch (e: Exception) {
+                      restartLater(1500)
+                  }
+              }
+
+              private fun restartLater(ms: Long) {
+                  handler.removeCallbacks(listenRunnable)
+                  handler.postDelayed(listenRunnable, ms)
+              }
+
+              private val listenRunnable = Runnable { listen() }
+
+              private fun speak(text: String, stopAfter: Boolean = false) {
+                  if (!ttsReady) {
+                      if (stopAfter) shutdown() else restartLater(300)
+                      return
+                  }
+                  speaking = true
+                  stopAfterSpeak = stopAfter
+                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
+              }
+
+              private val listener = object : RecognitionListener {
+                  override fun onResults(results: Bundle?) {
+                      val text = results
+                          ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                          ?.firstOrNull()
+                      if (text.isNullOrBlank()) {
+                          restartLater(200)
+                          return
+                      }
+                      val result = commands.handle(text)
+                      if (result.reply.isNotEmpty() || result.stop) {
+                          speak(result.reply.ifEmpty { "Bye" }, result.stop)
+                      } else {
+                          restartLater(200)
+                      }
+                  }
+
+                  override fun onError(error: Int) {
+                      when (error) {
+                          SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> shutdown()
+                          SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> restartLater(1000)
+                          else -> restartLater(300)
+                      }
+                  }
+
+                  override fun onReadyForSpeech(params: Bundle?) {}
+                  override fun onBeginningOfSpeech() {}
+                  override fun onRmsChanged(rmsdB: Float) {}
+                  override fun onBufferReceived(buffer: ByteArray?) {}
+                  override fun onEndOfSpeech() {}
+                  override fun onPartialResults(partialResults: Bundle?) {}
+                  override fun onEvent(eventType: Int, params: Bundle?) {}
+              }
+
+              private fun shutdown() {
+                  running = false
+                  handler.removeCallbacksAndMessages(null)
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  handler.removeCallbacksAndMessages(null)
+                  recognizer?.destroy()
+                  recognizer = null
+                  tts?.stop()
+                  tts?.shutdown()
+                  tts = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/jarvis/CommandHandler.kt <<'EOF'
+          package com.example.jarvis
+
+          import android.Manifest
+          import android.content.ActivityNotFoundException
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.ContactsContract
+          import android.telephony.SmsManager
+          import java.util.Locale
+
+          class CommandHandler(private val ctx: Context) {
+
+              data class Result(val reply: String, val stop: Boolean = false)
+
+              private val stopWords = setOf("bye", "by", "buy", "bai", "alvida", "goodbye")
+              private val openTriggers = setOf("kholo", "khol", "open", "chalao", "launch")
+              private val fillerWords = setOf(
+                  "kholo", "khol", "open", "chalao", "chalu", "launch", "start",
+                  "kar", "karo", "do", "de", "dena", "ko", "app", "please", "the"
+              )
+
+              private val msgRegex = Regex(
+                  "^(.+?)\\s+ko\\s+(whatsapp|sms|message|msg)\\s*(?:bhejo|bhej do|bhej|karo|kar do|likho)?\\s*(.*)$"
+              )
+              private val callRegex1 = Regex("^(?:call|phone|dial)\\s+(.+)$")
+              private val callRegex2 = Regex("^(.+?)\\s+ko\\s+(?:call|phone|fone|dial)(?:\\s+(?:karo|kar do|lagao|laga do))?$")
+
+              fun handle(raw: String): Result {
+                  val t = raw.lowercase(Locale.ROOT).trim()
+                  if (t.isEmpty()) return Result("")
+                  val words = t.split(Regex("\\s+"))
+
+                  // 1) Band karna
+                  if ((words.size <= 3 && words.any { it in stopWords }) || t.contains("band karo")) {
+                      return Result("Theek hai, bye", true)
+                  }
+
+                  // 2) SMS / WhatsApp: "<naam> ko whatsapp karo <message>"
+                  msgRegex.find(t)?.let { m ->
+                      return sendMessage(m.groupValues[1].trim(), m.groupValues[2], m.groupValues[3].trim())
+                  }
+
+                  // 3) Call
+                  (callRegex1.find(t) ?: callRegex2.find(t))?.let {
+                      return call(it.groupValues[1].trim())
+                  }
+
+                  // 4) App kholna
+                  if (words.any { it in openTriggers }) {
+                      val name = words.filter { it !in fillerWords }.joinToString(" ")
+                      if (name.isNotEmpty()) return openApp(name)
+                  }
+
+                  // Samajh nahi aaya -> chup raho aur sunte raho
+                  return Result("")
+              }
+
+              private fun has(perm: String) =
+                  ctx.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+
+              private fun resolveNumber(who: String): String? {
+                  val digits = who.filter { it.isDigit() }
+                  if (digits.length >= 7) return digits
+                  if (!has(Manifest.permission.READ_CONTACTS)) return null
+                  val c = ctx.contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                      "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                      arrayOf("%$who%"),
+                      null
+                  )
+                  c?.use { if (it.moveToFirst()) return it.getString(0) }
+                  return null
+              }
+
+              private fun call(who: String): Result {
+                  if (!has(Manifest.permission.CALL_PHONE)) return Result("Call ki permission nahi hai")
+                  val num = resolveNumber(who) ?: return Result("$who ka number nahi mila")
+                  return try {
+                      ctx.startActivity(
+                          Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(num)))
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      Result("$who ko call laga raha hu")
+                  } catch (e: Exception) {
+                      Result("Call nahi lag paya")
+                  }
+              }
+
+              private fun sendMessage(who: String, kind: String, body: String): Result {
+                  val num = resolveNumber(who) ?: return Result("$who ka number nahi mila")
+                  return if (kind == "whatsapp") whatsapp(who, num, body) else sms(who, num, body)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun sms(who: String, num: String, body: String): Result {
+                  if (body.isEmpty()) return Result("Message kya bhejna hai? Dobara bolo")
+                  if (!has(Manifest.permission.SEND_SMS)) return Result("SMS ki permission nahi hai")
+                  return try {
+                      val sm = if (Build.VERSION.SDK_INT >= 31) ctx.getSystemService(SmsManager::class.java)
+                      else SmsManager.getDefault()
+                      sm.sendMultipartTextMessage(num, null, sm.divideMessage(body), null, null)
+                      Result("$who ko SMS bhej diya")
+                  } catch (e: Exception) {
+                      Result("SMS nahi ja paya")
+                  }
+              }
+
+              private fun normalizeIn(num: String): String {
+                  val d = num.filter { it.isDigit() }
+                  return when {
+                      d.length == 10 -> "91$d"
+                      d.length == 11 && d.startsWith("0") -> "91" + d.drop(1)
+                      else -> d
+                  }
+              }
+
+              private fun whatsapp(who: String, num: String, body: String): Result {
+                  val uri = Uri.parse("https://wa.me/${normalizeIn(num)}?text=" + Uri.encode(body))
+                  val base = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  return try {
+                      try {
+                          ctx.startActivity(Intent(base).setPackage("com.whatsapp"))
+                      } catch (e: ActivityNotFoundException) {
+                          ctx.startActivity(base)
+                      }
+                      Result("$who ke liye WhatsApp khol diya, bas send dabao")
+                  } catch (e: Exception) {
+                      Result("WhatsApp nahi khul paya")
+                  }
+              }
+
+              private fun openApp(name: String): Result {
+                  val alias = mapOf("insta" to "instagram", "setting" to "settings", "yt" to "youtube")
+                  val q = (alias[name] ?: name).replace(" ", "")
+                  val pm = ctx.packageManager
+                  val apps = pm.queryIntentActivities(
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+                  )
+                  fun label(i: Int) = apps[i].loadLabel(pm).toString().lowercase(Locale.ROOT).replace(" ", "")
+                  val idx = apps.indices.firstOrNull { label(it) == q }
+                      ?: apps.indices.firstOrNull { label(it).contains(q) }
+                      ?: apps.indices.firstOrNull { label(it).length > 2 && q.contains(label(it)) }
+                      ?: return Result("$name naam ka app nahi mila")
+                  val launch = pm.getLaunchIntentForPackage(apps[idx].activityInfo.packageName)
+                      ?: return Result("$name nahi khul paya")
+                  return try {
+                      ctx.startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      Result("$name khol raha hu")
+                  } catch (e: Exception) {
+                      Result("$name nahi khul paya")
+                  }
+              }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
