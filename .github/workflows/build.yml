@@ -225,9 +225,12 @@ jobs:
               private var recognizer: SpeechRecognizer? = null
               private var tts: TextToSpeech? = null
               private var ttsReady = false
+              private var ttsInitDone = false
+              private var pendingStart = false
               private var running = false
               private var speaking = false
               private var stopAfterSpeak = false
+              private var useLang = true
               private lateinit var commands: CommandHandler
 
               override fun onBind(intent: Intent?): IBinder? = null
@@ -239,6 +242,7 @@ jobs:
               }
 
               override fun onInit(status: Int) {
+                  ttsInitDone = true
                   if (status == TextToSpeech.SUCCESS) {
                       tts?.language = Locale("en", "IN")
                       tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -249,35 +253,39 @@ jobs:
                       })
                       ttsReady = true
                   }
+                  if (pendingStart) {
+                      pendingStart = false
+                      begin()
+                  }
               }
 
               private fun afterSpeak() {
-                  handler.post {
-                      speaking = false
-                      if (stopAfterSpeak) shutdown() else listen()
-                  }
+                  handler.post { finishSpeaking() }
               }
+
+              private fun finishSpeaking() {
+                  handler.removeCallbacks(speakWatchdog)
+                  speaking = false
+                  if (stopAfterSpeak) shutdown() else listen()
+              }
+
+              private val speakWatchdog = Runnable { if (speaking) finishSpeaking() }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent?.action == ACTION_STOP) {
                       shutdown()
                       return START_NOT_STICKY
                   }
-                  startInForeground()
+                  startInForeground("Jarvis chal raha hai")
                   if (!running) {
                       running = true
-                      startRecognizer()
+                      if (ttsInitDone) begin() else pendingStart = true
                   }
                   return START_STICKY
               }
 
-              private fun startInForeground() {
-                  val nm = getSystemService(NotificationManager::class.java)
-                  if (Build.VERSION.SDK_INT >= 26) {
-                      nm.createNotificationChannel(
-                          NotificationChannel(CHANNEL, "Jarvis", NotificationManager.IMPORTANCE_LOW)
-                      )
-                  }
+              @Suppress("DEPRECATION")
+              private fun buildNotif(text: String): Notification {
                   val stopPi = PendingIntent.getService(
                       this, 0,
                       Intent(this, VoiceService::class.java).setAction(ACTION_STOP),
@@ -285,39 +293,58 @@ jobs:
                   )
                   val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL)
                   else Notification.Builder(this)
-                  @Suppress("DEPRECATION")
-                  val notif = builder
-                      .setContentTitle("Jarvis sun raha hai")
-                      .setContentText("Band karne ke liye \"bye\" bolo")
+                  return builder
+                      .setContentTitle("Jarvis")
+                      .setContentText(text)
                       .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                       .setOngoing(true)
                       .addAction(android.R.drawable.ic_delete, "Band karo", stopPi)
                       .build()
+              }
 
+              private fun startInForeground(text: String) {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(
+                          NotificationChannel(CHANNEL, "Jarvis", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val n = buildNotif(text)
                   if (Build.VERSION.SDK_INT >= 29) {
-                      startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                      startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
                   } else {
-                      startForeground(NOTIF_ID, notif)
+                      startForeground(NOTIF_ID, n)
                   }
               }
 
-              private fun startRecognizer() {
+              private fun updateNotif(text: String) {
+                  try {
+                      getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotif(text))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun begin() {
                   if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      updateNotif("Speech recognition available nahi hai")
                       speak("Is phone me speech recognition available nahi hai", true)
                       return
                   }
+                  createRecognizer()
+                  speak("Jarvis ready hai. Bolo")
+              }
+
+              private fun createRecognizer() {
                   recognizer?.destroy()
-                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-                      setRecognitionListener(listener)
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).also {
+                      it.setRecognitionListener(listener)
                   }
-                  listen()
               }
 
               private fun listen() {
                   if (!running || speaking) return
                   val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                       putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+                      if (useLang) putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
                       putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                   }
                   try {
@@ -341,7 +368,13 @@ jobs:
                   }
                   speaking = true
                   stopAfterSpeak = stopAfter
-                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
+                  val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
+                  if (r != TextToSpeech.SUCCESS) {
+                      finishSpeaking()
+                      return
+                  }
+                  handler.removeCallbacks(speakWatchdog)
+                  handler.postDelayed(speakWatchdog, 10000)
               }
 
               private val listener = object : RecognitionListener {
@@ -353,19 +386,33 @@ jobs:
                           restartLater(200)
                           return
                       }
+                      updateNotif("Suna: $text")
                       val result = commands.handle(text)
-                      if (result.reply.isNotEmpty() || result.stop) {
-                          speak(result.reply.ifEmpty { "Bye" }, result.stop)
-                      } else {
-                          restartLater(200)
+                      when {
+                          result.stop -> speak(result.reply, true)
+                          result.reply.isNotEmpty() -> speak(result.reply)
+                          else -> speak("Suna: $text. Samajh nahi aaya")
                       }
                   }
 
                   override fun onError(error: Int) {
                       when (error) {
-                          SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> shutdown()
+                          SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                              updateNotif("Mic permission nahi hai")
+                              speak("Mic ki permission nahi hai", true)
+                          }
+                          SpeechRecognizer.ERROR_NO_MATCH,
+                          SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> restartLater(200)
                           SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> restartLater(1000)
-                          else -> restartLater(300)
+                          12, 13 -> {
+                              useLang = false
+                              restartLater(500)
+                          }
+                          else -> {
+                              updateNotif("Error $error, dobara try kar raha hu")
+                              createRecognizer()
+                              restartLater(1000)
+                          }
                       }
                   }
 
@@ -556,6 +603,9 @@ jobs:
               }
           }
           EOF
+      - name: Apply overrides
+        run: |
+          if [ -d override ]; then cp -r override/. . ; fi
       - name: Build
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
