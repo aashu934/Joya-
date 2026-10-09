@@ -1,16 +1,12 @@
 package com.example.jarvis
-
 import android.accessibilityservice.AccessibilityService
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-
 class AutoSendService : AccessibilityService() {
-
     companion object {
         @Volatile
         var armedUntil: Long = 0L
     }
-
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (System.currentTimeMillis() > armedUntil) return
         val root = rootInActiveWindow ?: return
@@ -21,7 +17,6 @@ class AutoSendService : AccessibilityService() {
             armedUntil = 0L
         }
     }
-
     private fun findSend(root: AccessibilityNodeInfo, pkg: String): AccessibilityNodeInfo? {
         val byId = root.findAccessibilityNodeInfosByViewId("$pkg:id/send")
         val c = byId?.firstOrNull()?.let { clickableOf(it) }
@@ -38,7 +33,6 @@ class AutoSendService : AccessibilityService() {
         }
         return null
     }
-
     private fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var cur: AccessibilityNodeInfo? = n
         var depth = 0
@@ -49,6 +43,5 @@ class AutoSendService : AccessibilityService() {
         }
         return null
     }
-
     override fun onInterrupt() {}
 }
