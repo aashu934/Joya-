@@ -3,140 +3,111 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
+import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
-import android.speech.tts.TextToSpeech
-import android.speech.tts.Voice
 import android.view.Gravity
+import android.view.View
+import android.view.ViewOutlineProvider
 import android.widget.Button
-import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import java.util.Locale
-import kotlin.math.abs
 class MainActivity : Activity() {
-    private var tts: TextToSpeech? = null
-    private var voices: List<Voice> = emptyList()
-    private var voiceIdx = -1
-    private val pitches = floatArrayOf(1.0f, 1.2f, 1.35f, 1.5f, 1.7f)
+    private lateinit var avatar: ImageView
+    private lateinit var status: TextView
+    private lateinit var micBtn: Button
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val d = resources.displayMetrics.density
-        val prefs = jarvisPrefs(this)
-        tts = TextToSpeech(this) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts?.language = Locale("en", "IN")
-                val all = tts?.voices ?: emptySet<Voice>()
-                voices = all.filter {
-                    (it.locale.language == "en" || it.locale.language == "hi") &&
-                        !it.features.contains("notInstalled")
-                }.sortedBy { it.name }
+        val root = FrameLayout(this)
+        root.setBackgroundColor(Color.parseColor("#2B1650"))
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        avatar = ImageView(this).apply {
+            setImageResource(R.drawable.dp)
+            layoutParams = LinearLayout.LayoutParams((250 * d).toInt(), (250 * d).toInt())
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setRoundRect(0, 0, view.width, view.height, view.width / 2f)
+                }
             }
         }
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding((24 * d).toInt(), (24 * d).toInt(), (24 * d).toInt(), (24 * d).toInt())
+        col.addView(avatar)
+        status = TextView(this).apply {
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(0, (24 * d).toInt(), 0, (24 * d).toInt())
         }
-        root.addView(ImageView(this).apply {
-            setImageResource(R.drawable.dp)
-            layoutParams = LinearLayout.LayoutParams((140 * d).toInt(), (140 * d).toInt())
-        })
-        root.addView(TextView(this).apply {
-            text = "Jarvis Voice Assistant\n\nPehle 1, 2 aur 3 karo, phir Start dabao.\nNaam bolke bulao, jaise \"Jarvis, open whatsapp\"."
-            textSize = 15f
-            setPadding(0, (12 * d).toInt(), 0, (12 * d).toInt())
-        })
-        val nameBox = EditText(this).apply {
-            hint = "Assistant ka naam (jaise Jarvis)"
-            setText(prefs.getString("name", "jarvis"))
-            setSingleLine(true)
+        col.addView(status)
+        micBtn = Button(this).apply {
+            textSize = 30f
+            val bg = GradientDrawable()
+            bg.shape = GradientDrawable.OVAL
+            bg.setColor(Color.parseColor("#FF4F8B"))
+            background = bg
+            layoutParams = LinearLayout.LayoutParams((84 * d).toInt(), (84 * d).toInt())
+            setOnClickListener { toggle() }
         }
-        root.addView(nameBox)
-        fun addButton(label: String, onClick: () -> Unit) {
-            root.addView(Button(this).apply {
-                text = label
-                setOnClickListener { onClick() }
-            })
-        }
-        addButton("Naam save karo") {
-            prefs.edit().putString("name", nameBox.text.toString().trim()).apply()
-            Toast.makeText(this, "Naam save ho gaya. Stop → Start karo", Toast.LENGTH_SHORT).show()
-        }
-        addButton("1. Permissions do") { askPermissions() }
-        addButton("2. Overlay permission (apps kholne ke liye)") {
-            startActivity(
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+        col.addView(micBtn)
+        root.addView(
+            col,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
             )
+        )
+        val gear = TextView(this).apply {
+            text = "⚙"
+            textSize = 30f
+            setTextColor(Color.WHITE)
+            setPadding((16 * d).toInt(), (16 * d).toInt(), (16 * d).toInt(), (16 * d).toInt())
+            setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
         }
-        addButton("3. WhatsApp auto-send (Accessibility ON karo)") {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        }
-        addButton("Awaaz badlo (dabate jao, sunte jao)") { nextVoice() }
-        addButton("Awaaz patli / mothi (pitch)") { nextPitch() }
-        addButton("Start") { startAssistant() }
-        addButton("Stop") { stopService(Intent(this, VoiceService::class.java)) }
-        val scroll = ScrollView(this)
-        scroll.addView(root)
-        setContentView(scroll)
+        val gp = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        )
+        gp.gravity = Gravity.TOP or Gravity.END
+        root.addView(gear, gp)
+        setContentView(root)
     }
-    private fun sample() {
-        tts?.speak("Hi, main aapki assistant hu", TextToSpeech.QUEUE_FLUSH, null, "s")
-    }
-    private fun nextVoice() {
-        if (voices.isEmpty()) {
-            Toast.makeText(this, "Koi awaaz nahi mili", Toast.LENGTH_SHORT).show()
+    private fun toggle() {
+        if (UiBus.running) {
+            stopService(Intent(this, VoiceService::class.java))
+            UiBus.update("Band hai. Mic dabao", false)
             return
         }
-        voiceIdx = (voiceIdx + 1) % voices.size
-        val v = voices[voiceIdx]
-        tts?.voice = v
-        tts?.setPitch(jarvisPrefs(this).getFloat("pitch", 1.35f))
-        jarvisPrefs(this).edit().putString("voice_name", v.name).apply()
-        Toast.makeText(this, "Awaaz ${voiceIdx + 1}/${voices.size}: ${v.name}", Toast.LENGTH_SHORT).show()
-        sample()
-    }
-    private fun nextPitch() {
-        val p = jarvisPrefs(this)
-        val cur = p.getFloat("pitch", 1.35f)
-        val i = pitches.indexOfFirst { abs(it - cur) < 0.01f }
-        val next = pitches[(if (i < 0) 0 else i + 1) % pitches.size]
-        p.edit().putFloat("pitch", next).apply()
-        tts?.setPitch(next)
-        Toast.makeText(this, "Pitch: $next", Toast.LENGTH_SHORT).show()
-        sample()
-    }
-    private fun askPermissions() {
-        val perms = mutableListOf(
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.CALL_PHONE,
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.READ_CONTACTS,
-            Manifest.permission.READ_PHONE_STATE,
-            Manifest.permission.READ_CALL_LOG
-        )
-        if (Build.VERSION.SDK_INT >= 26) perms.add(Manifest.permission.ANSWER_PHONE_CALLS)
-        if (Build.VERSION.SDK_INT >= 31) perms.add(Manifest.permission.BLUETOOTH_CONNECT)
-        if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
-        requestPermissions(perms.toTypedArray(), 1)
-    }
-    private fun startAssistant() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Pehle permissions do", Toast.LENGTH_SHORT).show()
+            requestAllPermissions(this)
+            Toast.makeText(this, "Permissions allow karke dobara mic dabao", Toast.LENGTH_LONG).show()
             return
         }
         val i = Intent(this, VoiceService::class.java)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
-        Toast.makeText(this, "Jarvis shuru ho gaya", Toast.LENGTH_SHORT).show()
+        UiBus.update("Shuru ho rahi hu...", true)
     }
-    override fun onDestroy() {
-        tts?.stop()
-        tts?.shutdown()
-        super.onDestroy()
+    private fun refresh() {
+        status.text = UiBus.status
+        micBtn.text = if (UiBus.running) "⏹" else "🎤"
+        val s = if (UiBus.speakingNow) 1.07f else 1.0f
+        avatar.animate().scaleX(s).scaleY(s).setDuration(250).start()
+    }
+    override fun onResume() {
+        super.onResume()
+        UiBus.listener = { refresh() }
+        refresh()
+    }
+    override fun onPause() {
+        UiBus.listener = null
+        super.onPause()
     }
 }

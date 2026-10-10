@@ -30,6 +30,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import java.util.Locale
+import java.util.concurrent.Executors
 class VoiceService : Service(), TextToSpeech.OnInitListener {
     companion object {
         const val ACTION_STOP = "com.example.jarvis.STOP"
@@ -46,6 +47,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private var speaking = false
     private var stopAfterSpeak = false
     private var useLang = true
+    private var thinking = false
+    private var savedVoice: android.speech.tts.Voice? = null
+    private val worker = Executors.newSingleThreadExecutor()
     private var activeUntil = 0L
     private var callRegistered = false
     private var overlayView: View? = null
@@ -63,13 +67,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             val prefs = jarvisPrefs(this)
             tts?.language = Locale("en", "IN")
             tts?.setPitch(prefs.getFloat("pitch", 1.35f))
-            tts?.setSpeechRate(1.05f)
+            tts?.setSpeechRate(1.0f)
             try {
                 val vn = prefs.getString("voice_name", null)
-                if (vn != null) {
-                    val v = tts?.voices?.firstOrNull { it.name == vn }
-                    if (v != null) tts?.voice = v
-                }
+                if (vn != null) savedVoice = tts?.voices?.firstOrNull { it.name == vn }
             } catch (e: Exception) {
             }
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -91,7 +92,66 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private fun finishSpeaking() {
         handler.removeCallbacks(speakWatchdog)
         speaking = false
+        if (running) UiBus.update("Sun rahi hu...", true)
         if (stopAfterSpeak) shutdown() else listen()
+    }
+    private fun voiceFor(text: String): String {
+        val t = tts ?: return text
+        val hasDeva = text.any { it in '\u0900'..'\u097F' }
+        val saved = savedVoice
+        if (saved != null && (!hasDeva || saved.locale.language == "hi")) {
+            t.voice = saved
+            return text
+        }
+        val r = t.setLanguage(if (hasDeva) Locale("hi", "IN") else Locale("en", "IN"))
+        if (hasDeva && (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED)) {
+            t.setLanguage(Locale("en", "IN"))
+            return latinize(text)
+        }
+        return text
+    }
+    private fun handleLocal(cmd: String): Boolean {
+        val l = cmd.lowercase(Locale.ROOT).trim()
+        val w = l.split(Regex("\\s+"))
+        if (PhoneControl.ringing) {
+            val spk = l.contains("speaker") || l.contains("स्पीकर")
+            val ans = listOf("utha", "uthao", "pick", "answer", "receive", "उठा", "रिसीव").any { l.contains(it) }
+            val rej = listOf("kaat", "cut", "reject", "decline", "काट", "रिजेक्ट", "डिक्लाइन").any { l.contains(it) }
+            if (ans) {
+                val ok = PhoneControl.answer(this)
+                if (ok && spk) handler.postDelayed({ PhoneControl.speaker(this, true) }, 1200)
+                speak(if (ok) "ठीक है, कॉल उठा लिया" else "कॉल नहीं उठा पाई, फ़ोन की परमिशन देखिए")
+                return true
+            }
+            if (rej) {
+                val ok = PhoneControl.hangup(this)
+                speak(if (ok) "कॉल काट दिया" else "कॉल नहीं काट पाई")
+                return true
+            }
+        }
+        val bye = listOf("bye", "alvida", "goodbye", "बाय", "अलविदा")
+        if (w.size <= 3 && (bye.any { l.contains(it) } || l.contains("band karo") || l.contains("बंद करो"))) {
+            speak("ठीक है, अपना ख्याल रखना। बाय!", true)
+            return true
+        }
+        return false
+    }
+    private fun onBrainReply(asked: String, reply: Brain.Reply?) {
+        if (!running) return
+        if (reply == null) {
+            val r = commands.handle(asked)
+            if (r.reply.isNotEmpty()) speak(r.reply, r.stop) else speak("अभी मुझे समझ नहीं आया, फिर से बोलिए")
+            return
+        }
+        var say = reply.say
+        var stop = false
+        if (reply.command.isNotBlank()) {
+            val r = commands.handle(reply.command)
+            stop = r.stop
+            if (r.reply.contains("nahi", ignoreCase = true) || r.reply.startsWith("Sorry")) say = r.reply
+        }
+        if (say.isBlank()) say = "ठीक है"
+        speak(say, stop)
     }
     private val speakWatchdog = Runnable { if (speaking) finishSpeaking() }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -199,9 +259,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private fun wakeName(): String =
         (jarvisPrefs(this).getString("name", "jarvis") ?: "").trim().lowercase(Locale.ROOT)
     private fun isName(w: String, name: String): Boolean {
-        val a = w.filter { it.isLetterOrDigit() }
-        if (a.isEmpty()) return false
-        return a == name || (name.length >= 4 && levenshtein(a, name) <= 1)
+        val a = latinize(w.lowercase(Locale.ROOT)).filter { it.isLetterOrDigit() }
+        val n = latinize(name).filter { it.isLetterOrDigit() }
+        if (a.isEmpty() || n.isEmpty()) return false
+        return a == n || (n.length >= 4 && levenshtein(a, n) <= 1)
     }
     @Suppress("DEPRECATION")
     private val phoneListener = object : PhoneStateListener() {
@@ -267,11 +328,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
         createRecognizer()
         registerCallListener()
+        UiBus.update("Sun rahi hu...", true)
         val name = wakeName()
-        if (name.isEmpty()) {
+        val shown = name.replaceFirstChar { it.uppercase() }
+        if (Brain.enabled(this)) {
+            if (name.isEmpty()) speak("नमस्ते! बोलिए, क्या करना है?")
+            else speak("नमस्ते! मैं $shown हूँ। मेरा नाम लेकर बुलाइए।")
+        } else if (name.isEmpty()) {
             speak("Hi, main aa gayi. Bolo, kya karna hai?")
         } else {
-            val shown = name.replaceFirstChar { it.uppercase() }
             speak("Hi, main $shown hu. Mera naam lekar bulao")
         }
     }
@@ -282,12 +347,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
     private fun listen() {
-        if (!running || speaking) return
+        if (!running || speaking || thinking) return
         muteBeep()
+        val lang = if (Brain.enabled(this)) "hi-IN" else "en-IN"
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            if (useLang) putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+            if (useLang) putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1600L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1600L)
         }
         try {
             recognizer?.startListening(i)
@@ -308,7 +376,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         unmuteBeep()
         speaking = true
         stopAfterSpeak = stopAfter
-        val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
+        UiBus.update("Bol rahi hu...", true, true)
+        val r = tts?.speak(voiceFor(text), TextToSpeech.QUEUE_FLUSH, null, "u")
         if (r != TextToSpeech.SUCCESS) {
             finishSpeaking()
             return
@@ -348,6 +417,25 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 return
             }
             updateNotif("Suna: $cmd")
+            if (Brain.enabled(this@VoiceService)) {
+                if (handleLocal(cmd)) return
+                thinking = true
+                UiBus.update("Soch rahi hu...", true)
+                val asked = cmd
+                val shownName = name.replaceFirstChar { it.uppercase() }
+                worker.execute {
+                    val reply = try {
+                        Brain.ask(this@VoiceService, asked, shownName.ifEmpty { "Jarvis" })
+                    } catch (e: Exception) {
+                        null
+                    }
+                    handler.post {
+                        thinking = false
+                        onBrainReply(asked, reply)
+                    }
+                }
+                return
+            }
             val result = commands.handle(cmd)
             when {
                 result.stop -> speak(result.reply, true)
@@ -388,6 +476,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
     private fun shutdown() {
         running = false
+        UiBus.update("Band hai. Mic dabao", false)
         handler.removeCallbacksAndMessages(null)
         unregisterCallListener()
         removeOverlay()
@@ -397,6 +486,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
     override fun onDestroy() {
         running = false
+        UiBus.update("Band hai. Mic dabao", false)
+        worker.shutdownNow()
         handler.removeCallbacksAndMessages(null)
         unregisterCallListener()
         removeOverlay()
